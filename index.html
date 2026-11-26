@@ -1,0 +1,849 @@
+<title>Eastern Aries Galactic Trading Company</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>
+/* Layout: one C64 "monitor" — light-blue border frame around a 320x200 pixel screen, scaled up crisp. Single dark look by design. */
+:root{
+  --border:#887ECB;      /* C64 light blue border */
+  --screen:#000000;
+  --ink:#ADADAD;
+  --ink-dim:#626262;
+  --accent:#C9D487;
+  --font-pixel:"Press Start 2P", "Courier New", monospace;
+  color-scheme:dark;
+}
+html,body{height:100%}
+body{
+  background:var(--border);color:var(--ink);margin:0;
+  font-family:var(--font-pixel);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+  padding-left:max(16px, env(safe-area-inset-left, 0px));
+  padding-right:max(16px, env(safe-area-inset-right, 0px));
+  padding-block:16px;box-sizing:border-box;overflow:hidden;
+}
+#scr{
+  display:block;background:var(--screen);
+  image-rendering:pixelated;image-rendering:crisp-edges;
+  outline:none;max-width:100%;
+}
+#scr:focus-visible{box-shadow:0 0 0 3px var(--accent)}
+#hint{font-size:8px;line-height:1.6;color:#50459B;text-align:center;max-width:640px}
+</style>
+
+<canvas id="scr" width="320" height="200" tabindex="0" aria-label="Eastern Aries Galactic Trading Company game screen. Keyboard controlled."></canvas>
+<div id="hint">CLICK THE SCREEN, THEN USE THE KEYBOARD &nbsp;·&nbsp; M TOGGLES SOUND</div>
+
+<script>
+"use strict";
+/* ================================================================
+   EASTERN ARIES GALACTIC TRADING COMPANY (EAGTC) — a freight-run game with five alien crew.
+   Vertical slice: contract -> hire 5 crew -> node map -> real-time
+   legs with pirates / asteroids / ion storms -> delivery -> scores.
+   ================================================================ */
+
+// ---------- palette (C64-style 16 colours) ----------
+const PAL=['#000000','#FFFFFF','#9F4E44','#6ABFC6','#A057A3','#5CAB5E','#50459B','#C9D487',
+           '#A1683C','#6D5412','#CB7E75','#626262','#898989','#9AE29B','#887ECB','#ADADAD'];
+const BLK=0,WHT=1,RED=2,CYN=3,PUR=4,GRN=5,BLU=6,YEL=7,ORG=8,BRN=9,LRED=10,DGRY=11,GRY=12,LGRN=13,LBLU=14,LGRY=15;
+
+const W=320,H=200;
+const cv=document.getElementById('scr');
+const ctx=cv.getContext('2d');
+ctx.imageSmoothingEnabled=false;
+
+// ---------- scaling ----------
+function fit(){
+  const aw=window.innerWidth-32, ah=window.innerHeight-60;
+  let s=Math.min(aw/W, ah/H);
+  if(s>=2) s=Math.floor(s);
+  s=Math.max(0.5,s);
+  cv.style.width=Math.round(W*s)+'px';
+  cv.style.height=Math.round(H*s)+'px';
+}
+window.addEventListener('resize',fit); fit();
+
+// ---------- 8x8 glyphs built from the pixel font ----------
+let glyphs=[]; let atlas={};
+function buildGlyphs(font){
+  const c=document.createElement('canvas'); c.width=16; c.height=16;
+  const g=c.getContext('2d',{willReadFrequently:true});
+  const out=[];
+  // find where the font puts the top of a capital, so every glyph lands in an exact 8x8 cell
+  g.font='8px '+font; g.textBaseline='top'; g.fillStyle='#fff';
+  g.clearRect(0,0,16,16); g.fillText('H',0,4);
+  const pd=g.getImageData(0,0,16,16).data; let top=4;
+  for(let y=0;y<16;y++){let any=false; for(let x=0;x<16;x++) if(pd[(y*16+x)*4+3]>110) any=true; if(any){top=y;break;}}
+  const oy=4-top;
+  for(let code=32;code<128;code++){
+    g.clearRect(0,0,16,16); g.fillStyle='#fff';
+    g.font='8px '+font; g.textBaseline='top';
+    g.fillText(String.fromCharCode(code),0,4+oy);
+    const d=g.getImageData(0,4,8,8).data; const m=new Uint8Array(64);
+    for(let i=0;i<64;i++) m[i]=d[i*4+3]>110?1:0;
+    out.push(m);
+  }
+  // custom glyph 127: solid block
+  out[95]=new Uint8Array(64).fill(1);
+  glyphs=out; atlas={};
+}
+function hexRgb(h){return [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
+function getAtlas(col){
+  if(atlas[col]) return atlas[col];
+  const c=document.createElement('canvas'); c.width=96*8; c.height=8;
+  const g=c.getContext('2d'); const id=g.createImageData(96*8,8); const [r,gg,b]=hexRgb(PAL[col]);
+  for(let k=0;k<96;k++){const m=glyphs[k]; if(!m) continue;
+    for(let i=0;i<64;i++) if(m[i]){const p=((i>>3)*768+k*8+(i&7))*4; id.data[p]=r;id.data[p+1]=gg;id.data[p+2]=b;id.data[p+3]=255;}}
+  g.putImageData(id,0,0); atlas[col]=c; return c;
+}
+function txtPx(x,y,s,col=WHT,sc=1,bg=null){
+  s=String(s).toUpperCase(); const a=getAtlas(col);
+  for(let i=0;i<s.length;i++){
+    const dx=x+i*8*sc;
+    if(bg!==null){ctx.fillStyle=PAL[bg];ctx.fillRect(dx,y,8*sc,8*sc);}
+    let k=s.charCodeAt(i)-32; if(k<0||k>95) k=31; if(k===0) continue;
+    ctx.drawImage(a,k*8,0,8,8,dx,y,8*sc,8*sc);
+  }
+}
+function txt(cx,cy,s,col=WHT,bg=null){txtPx(cx*8,cy*8,s,col,1,bg);}
+function ctr(cy,s,col=WHT,bg=null){s=String(s);txt(Math.floor((40-s.length)/2),cy,s,col,bg);}
+function rect(x,y,w,h,col){ctx.fillStyle=PAL[col];ctx.fillRect(x|0,y|0,w|0,h|0);}
+function bar(x,y,w,v,col){rect(x,y+1,w,6,DGRY); rect(x,y+1,Math.max(0,Math.round(w*Math.min(100,v)/100)),6,col);}
+function valCol(v){return v>=70?LGRN:v>=35?YEL:LRED;}
+
+buildGlyphs('monospace');
+(async()=>{try{await document.fonts.load('8px "Press Start 2P"');
+  if(document.fonts.check('8px "Press Start 2P"')) buildGlyphs('"Press Start 2P"');}catch(e){}})();
+
+// ---------- sprites ----------
+function sprite(rows){
+  const h=rows.length,w=rows[0].length; const c=document.createElement('canvas'); c.width=w;c.height=h;
+  const g=c.getContext('2d');
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const ch=rows[y][x]; if(ch!=='.'){g.fillStyle=PAL[parseInt(ch,16)];g.fillRect(x,y,1,1);}}
+  return c;
+}
+const SPR_SHIP=sprite([
+"......11................",
+".....1ff1...............",
+"....1ffff111111.........",
+"..eeffcccccccff111......",
+"eeefffcc666cccccff11....",
+"88effff3333ccccccccf11..",
+"eeefffcc666cccccff11....",
+"..eeffcccccccff111......",
+"....1ffff111111.........",
+".....1ff1...............",
+"......11................"]);
+const SPR_PIR=sprite([
+"........2222........",
+"....22aa4444........",
+"..2aa444444444......",
+"aa44444444444442222.",
+"7a4444bb44444444444a",
+"aa44444444444442222.",
+"..2aa444444444......",
+"....22aa4444........",
+"........2222........"]);
+const SPR_DOCK=sprite([
+"....ffff....",
+"..ffccccff..",
+".fcc3333ccf.",
+"fcc3....3ccf",
+"fc3......3cf",
+"fc3......3cf",
+"fcc3....3ccf",
+".fcc3333ccf.",
+"..ffccccff..",
+"....ffff...."]);
+
+// ---------- SID-style audio ----------
+const AU={ctx:null,on:true,master:null,pw25:null,pw50:null,noise:null};
+function auInit(){
+  if(AU.ctx){ if(AU.ctx.state==='suspended') AU.ctx.resume(); return; }
+  try{
+    const C=window.AudioContext||window.webkitAudioContext; AU.ctx=new C();
+    AU.master=AU.ctx.createGain(); AU.master.gain.value=AU.on?0.16:0; AU.master.connect(AU.ctx.destination);
+    AU.pw25=mkPulse(0.25); AU.pw50=mkPulse(0.5);
+    const len=AU.ctx.sampleRate; const b=AU.ctx.createBuffer(1,len,AU.ctx.sampleRate); const d=b.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=Math.random()*2-1; AU.noise=b;
+  }catch(e){AU.ctx=null;}
+}
+function mkPulse(duty){const n=48,re=new Float32Array(n),im=new Float32Array(n);
+  for(let k=1;k<n;k++) re[k]=2/(k*Math.PI)*Math.sin(k*Math.PI*duty);
+  return AU.ctx.createPeriodicWave(re,im);}
+function voice(o){
+  if(!AU.ctx) return; const c=AU.ctx; const t0=o.t??c.currentTime; const dur=o.dur||0.1;
+  const os=c.createOscillator();
+  if(o.wave==='pulse') os.setPeriodicWave(AU.pw25); else if(o.wave==='sq') os.setPeriodicWave(AU.pw50); else os.type=o.wave||'triangle';
+  os.frequency.setValueAtTime(o.f0,t0); if(o.f1) os.frequency.exponentialRampToValueAtTime(o.f1,t0+dur);
+  const g=c.createGain(); g.gain.setValueAtTime(0.0001,t0); g.gain.linearRampToValueAtTime(o.vol??0.4,t0+(o.at||0.004));
+  g.gain.exponentialRampToValueAtTime(0.0008,t0+dur);
+  os.connect(g); g.connect(AU.master); os.start(t0); os.stop(t0+dur+0.03);
+}
+function noise(o){
+  if(!AU.ctx) return; const c=AU.ctx; const t0=o.t??c.currentTime; const dur=o.dur||0.3;
+  const s=c.createBufferSource(); s.buffer=AU.noise;
+  const f=c.createBiquadFilter(); f.type='lowpass'; f.frequency.setValueAtTime(o.f||3000,t0);
+  f.frequency.exponentialRampToValueAtTime(o.f1||200,t0+dur);
+  const g=c.createGain(); g.gain.setValueAtTime(o.vol??0.5,t0); g.gain.exponentialRampToValueAtTime(0.0008,t0+dur);
+  s.connect(f); f.connect(g); g.connect(AU.master); s.start(t0); s.stop(t0+dur+0.03);
+}
+const SFX={
+  key(){voice({wave:'sq',f0:1200,dur:0.04,vol:0.15});},
+  sel(){voice({wave:'pulse',f0:660,f1:990,dur:0.08,vol:0.25});},
+  laser(){voice({wave:'pulse',f0:1800,f1:300,dur:0.16,vol:0.25});},
+  elaser(){voice({wave:'sawtooth',f0:900,f1:140,dur:0.22,vol:0.18});},
+  hit(){noise({dur:0.35,vol:0.6,f:2500,f1:120});},
+  shield(){voice({wave:'triangle',f0:300,f1:900,dur:0.15,vol:0.3});},
+  boom(){noise({dur:0.9,vol:0.8,f:1800,f1:60}); voice({wave:'triangle',f0:120,f1:30,dur:0.6,vol:0.5});},
+  alarm(){for(let i=0;i<4;i++){const t=(AU.ctx?AU.ctx.currentTime:0)+i*0.16; voice({wave:'sq',f0:i%2?660:880,dur:0.14,vol:0.18,t});}},
+  fail(){voice({wave:'sq',f0:220,f1:110,dur:0.3,vol:0.25}); noise({dur:0.2,vol:0.2,f:5000,f1:1000});},
+  rock(){noise({dur:0.15,vol:0.35,f:900,f1:100});},
+  win(){const ns=[60,64,67,72,67,72]; ns.forEach((n,i)=>voice({wave:'pulse',f0:mf(n+12),dur:0.18,vol:0.25,t:(AU.ctx?AU.ctx.currentTime:0)+i*0.12}));},
+  lose(){const ns=[64,60,57,52]; ns.forEach((n,i)=>voice({wave:'sawtooth',f0:mf(n),dur:0.4,vol:0.2,t:(AU.ctx?AU.ctx.currentTime:0)+i*0.3}));},
+};
+function mf(n){return 440*Math.pow(2,(n-69)/12);}
+// tracker-style title tune: arpeggios + pulse bass (Am F C G)
+const MUS={timer:null,next:0,step:0};
+const CHORDS=[[57,60,64],[53,57,60],[48,52,55],[55,59,62]];
+function musicStart(){ if(!AU.ctx||MUS.timer) return; MUS.next=AU.ctx.currentTime+0.06; MUS.step=0; MUS.timer=setInterval(musicTick,25); }
+function musicStop(){ if(MUS.timer){clearInterval(MUS.timer);MUS.timer=null;} }
+function musicTick(){
+  const c=AU.ctx; if(!c) return; const st=0.118;
+  while(MUS.next<c.currentTime+0.15){
+    const s=MUS.step, bar=Math.floor(s/16)%4, ch=CHORDS[bar], i=s%16, part=Math.floor(s/64)%2;
+    const arp=[ch[0]+12,ch[1]+12,ch[2]+12,ch[1]+12][i%4];
+    voice({wave:'pulse',f0:mf(arp),dur:st*0.95,vol:0.09,t:MUS.next});
+    if(i%2===0) voice({wave:'sq',f0:mf(ch[0]-12+(i%4===2?12:0)),dur:st*1.7,vol:0.16,t:MUS.next});
+    if(i%4===2) noise({dur:0.05,vol:0.12,f:8000,f1:4000,t:MUS.next});
+    if(part===1 && [0,3,6,10,12].includes(i)){
+      const mel=[ch[2]+12,ch[0]+24,ch[1]+12,ch[2]+12,ch[0]+24][[0,3,6,10,12].indexOf(i)];
+      voice({wave:'triangle',f0:mf(mel+12),dur:st*2.6,vol:0.22,t:MUS.next});
+    }
+    MUS.next+=st; MUS.step++;
+  }
+}
+function setSound(on){AU.on=on; if(AU.master) AU.master.gain.value=on?0.16:0;}
+
+// ---------- helpers ----------
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const ri=(a,b)=>Math.floor(rnd(a,b+1));
+const pick=a=>a[Math.floor(Math.random()*a.length)];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const money=n=>(n<0?'-$':'$')+Math.abs(Math.round(n));
+function pad(s,n){s=String(s);return s.length>=n?s.slice(0,n):s+' '.repeat(n-s.length);}
+function lpad(s,n){s=String(s);return s.length>=n?s.slice(-n):' '.repeat(n-s.length)+s;}
+function wrap(s,n){const words=String(s).split(' ');const out=[];let line='';
+  for(const w of words){ if((line+(line?' ':'')+w).length>n){ if(line) out.push(line); line=w; } else line+=(line?' ':'')+w; }
+  if(line) out.push(line); return out;}
+
+// ---------- game data ----------
+const DEPTS=[
+  {k:'NAV',name:'NAVIGATION',orders:['EVADE','HOLD STEADY','FULL SPEED','FLEE']},
+  {k:'ENG',name:'ENGINEERING',orders:['BALANCED','SHIELDS','WEAPONS','ENGINES']},
+  {k:'WPN',name:'WEAPONS',orders:['TGT WEAPONS','TGT ENGINES','TGT HULL','ASTEROIDS']},
+  {k:'SCN',name:'SCANNERS',orders:['THREAT WARN','ANALYZE','ROCK TRACK','CHART ROUTE']},
+  {k:'REP',name:'REPAIR',orders:['HULL','SHIELD GEN','WEAPONS','ENGINES','SCANNERS']},
+];
+const ORDER_HELP={
+  'EVADE':'HARDER TO HIT. SLIGHTLY SLOWER.','HOLD STEADY':'BETTER AIM. EASIER TARGET.','FULL SPEED':'FAST LEGS. SHORT FIELDS. MORE HITS.','FLEE':'BREAK AWAY FROM PIRATES. NO BOUNTY.',
+  'BALANCED':'EVEN POWER SPLIT.','SHIELDS':'FAST SHIELD RECHARGE.','WEAPONS':'FASTER, HARDER FIRE.','ENGINES':'SPEED, EVASION, ESCAPE.',
+  'TGT WEAPONS':'WEAKEN ENEMY GUNS.','TGT ENGINES':'SLOW THEM. EASIER TO FLEE.','TGT HULL':'MAX DAMAGE. FASTER KILLS.','ASTEROIDS':'SHOOT ROCKS. IGNORES PIRATES.',
+  'THREAT WARN':'EARLY WARNING. FEWER HITS/FAULTS.','ANALYZE':'FIND WEAK SPOTS. AIM BONUS.','ROCK TRACK':'PLOT ROCKS. HELPS DODGING.','CHART ROUTE':'REVEAL NODES AHEAD WHILE CRUISING.',
+};
+const ROGUE=['HOLD STEADY','WEAPONS','TGT HULL','ANALYZE','WEAPONS'];
+const PM={BALANCED:[1,1,1],SHIELDS:[1.6,.7,.7],WEAPONS:[.7,1.6,.7],ENGINES:[.7,.7,1.6]};
+const SYSN={eng:'ENGINES',wpn:'WEAPONS',scn:'SCANNERS',shg:'SHIELD GEN'};
+const REP_KEYS={'HULL':'hull','SHIELD GEN':'shg','WEAPONS':'wpn','ENGINES':'eng','SCANNERS':'scn'};
+
+const SPECIES=['VORRIK','THESSAN','OOMBAL','KRILLITH','ZEPHID','GRUNNAR','QUELLAN','SKAAR','MIRRODI','PLOOTAN'];
+const SYL=['ZOR','VEK','KRA','OOM','BAL','QUI','XAN','RIL','MOR','DAX','ULU','PEX','GRA','NIX','SLO','TAR','VUU','HEK','ZIB','OTH','YAR','LUM'];
+const QUIRKS=['VETERAN','LUCKY','GAMBLER','CHATTY','TOUGH','FRAIL'];
+const TEMPER_HINT={
+  CALM:['I DO NOT RATTLE EASILY.','PANIC WASTES OXYGEN.','I SLEEP FINE DURING BOARDINGS.'],
+  NERVOUS:['THE ROUTE IS SAFE, YES? MOSTLY?','I PREFER QUIET RUNS. VERY QUIET.','ARE THERE PIRATES? BE HONEST.'],
+  HOTHEAD:['PIRATES? I HOPE WE MEET SOME.','I DO THINGS MY WAY. FAST.','ORDERS ARE MORE LIKE SUGGESTIONS.'],
+};
+const QUIRK_HINT={VETERAN:'SURVIVED THE ORRAN BLOCKADE.',LUCKY:'NEVER LOST A HAND OF ZOBB.',GAMBLER:'SOME DAYS BRILLIANT. SOME DAYS NOT.',
+  CHATTY:'I LOVE TO TALK. ABOUT ANYTHING.',TOUGH:'TOOK A RAIL SLUG ONCE. IT ITCHED.',FRAIL:'MY BONES ARE MOSTLY CARTILAGE.'};
+const LINES={
+  CALM:{enemy:['CONTACTS. STAY PROFESSIONAL.','PIRATES. HOW TEDIOUS.'],hit:['MINOR DAMAGE. CARRY ON.','THAT ONE STUNG.'],kill:['TARGET DOWN.','SCRATCH ONE RAIDER.'],
+        rocks:['ROCKS AHEAD. STEADY NOW.'],storm:['ION STORM. EXPECT FAULTS.'],hurt:['I AM FINE. MOSTLY.'],recover:['BACK AT MY POST.'],quiet:['NICE AND QUIET.'],dock:['GOOD TO STRETCH THE LEGS.']},
+  NERVOUS:{enemy:['OH NO. OH NO NO NO.','THEY HAVE GUNS. BIG ONES.'],hit:['WE ARE HIT! WE ARE HIT!','I KNEW THIS WOULD HAPPEN!'],kill:['DID WE GET IT? WE GOT IT!'],
+        rocks:['ROCKS?! NOBODY SAID ROCKS!'],storm:['MY CONSOLE IS SPARKING!'],hurt:['IS THAT MY BLOOD? IT IS BLUE!'],recover:['OK. OK. I AM OK.'],panic:['I CAN NOT DO THIS!','*HIDES UNDER CONSOLE*','WE ARE ALL GOING TO DIE!'],quiet:['TOO QUIET. I HATE QUIET.'],dock:['CAN WE STAY HERE FOREVER?']},
+  HOTHEAD:{enemy:['FINALLY! SOME ACTION!','LET ME AT THEM!'],hit:['THEY WILL PAY FOR THAT!','IS THAT ALL YOU GOT?'],kill:['HA! WHO IS NEXT?'],
+        rocks:['JUST BLAST THROUGH!'],storm:['STORMS DO NOT SCARE ME.'],hurt:['JUST A SCRATCH!'],recover:['FINE. YOUR WAY.'],rogue:['FORGET ORDERS! ATTACK!','DEFENSE IS FOR COWARDS!','I KNOW BETTER, CAPTAIN!'],quiet:['BORING.'],dock:['WAKE ME FOR THE SHOOTING.']},
+};
+const CARGO=['XENON ICE CORES','LIVE GRUBWORM EGGS','REACTOR SPONGES','DIPLOMATIC POUCHES','CRYO MELONS','RAW QUASI-CRYSTAL','MEDICAL NANOGEL','ANTIQUE ROBOT PARTS'];
+const PORTS=['KESSARIN DEPOT','HALO 9 EXCHANGE','DRYFALL STATION','OUTPOST MERRIT','VAULT OF UNN','SABLE ANCHORAGE'];
+const NODE_NAME={P:'PIRATE ZONE',A:'ASTEROID FIELD',X:'ION STORM',S:'REPAIR DOCK',Q:'QUIET SPACE',D:'DESTINATION','?':'UNCHARTED'};
+const NODE_COL={P:LRED,A:ORG,X:PUR,S:LGRN,Q:GRY,D:YEL,'?':WHT};
+const NODE_CH={P:'P',A:'A',X:'X',S:'S',Q:'.',D:'D'};
+
+// ---------- high scores (per browser) ----------
+const SKEY='eagtc.scores.v1';
+function loadScores(){
+  try{const s=JSON.parse(localStorage.getItem(SKEY)); if(Array.isArray(s)) return s;}catch(e){}
+  return [{n:'ZORVEK',p:4200},{n:'MOOMBA',p:3100},{n:'QUIXAN',p:2400},{n:'OTHRIL',p:1500},{n:'DAXLUM',p:800}];
+}
+function saveScores(s){try{localStorage.setItem(SKEY,JSON.stringify(s));}catch(e){}}
+
+// ---------- state ----------
+let G={screen:'title',scores:loadScores(),frame:0};
+const SHIP_X=34, SHIP_Y=38, VP_TOP=8, VP_BOT=80;
+
+function newCandidate(d){
+  const temper=pick(['CALM','CALM','NERVOUS','HOTHEAD','NERVOUS','HOTHEAD','CALM']);
+  const quirk=Math.random()<0.55?pick(QUIRKS):null;
+  const skill=clamp(Math.round(rnd(2,9.4)),2,9), rel=clamp(ri(2,9)+(quirk==='VETERAN'?1:0),1,9);
+  let sal=60+skill*36+rel*14+(quirk==='VETERAN'?60:0)+(quirk==='LUCKY'?40:0)-(temper==='NERVOUS'?40:0)-(temper==='HOTHEAD'?25:0)+ri(-25,25);
+  sal=Math.max(60,Math.round(sal/10)*10);
+  let name=pick(SYL)+pick(SYL).toLowerCase(); if(Math.random()<0.3) name+=pick(SYL).slice(0,2).toLowerCase();
+  return {name:name.toUpperCase().slice(0,8),species:pick(SPECIES),skill,rel,temper,quirk,salary:sal,
+    quote:pick(TEMPER_HINT[temper]),qhint:quirk?QUIRK_HINT[quirk]:'',hp:100,dead:false,panicT:0,rogueT:0,order:DEPTS[d].orders[0]};
+}
+function refWord(r){return r>=7?'GOOD':r>=4?'FAIR':'POOR';}
+
+function newContracts(){
+  const tiers=[0,1,2].sort(()=>Math.random()-0.5); const cg=CARGO.slice().sort(()=>Math.random()-0.5), pt=PORTS.slice().sort(()=>Math.random()-0.5);
+  return tiers.map((t,i)=>{const jumps=ri(5,8); return {cargo:cg[i],port:pt[i],tier:t,jumps,
+    pay:Math.round((1500+jumps*420+t*1500+ri(0,300))/10)*10};});
+}
+
+function newMap(c){
+  const N=c.jumps; const cols=[[{lane:1,type:'Q',known:true,visited:true,links:[]}]];
+  const dock=ri(2,Math.max(2,N-2));
+  for(let i=1;i<N;i++){
+    let lanes=pick([[0,1,2],[0,1],[1,2],[0,2],[0,1,2]]);
+    const col=lanes.map(l=>{
+      const p=0.24+0.035*i+0.06*c.tier; const r=Math.random(); let type;
+      if(i===dock&&l===lanes[0]&&Math.random()<0.8) type='S';
+      else if(r<p) type='P'; else if(r<p+0.2) type='A'; else if(r<p+0.33) type='X'; else if(r<p+0.36) type='S'; else type='Q';
+      return {lane:l,type,known:false,visited:false,links:[]};
+    });
+    cols.push(col);
+  }
+  cols.push([{lane:1,type:'D',known:true,visited:false,links:[]}]);
+  for(let i=0;i<cols.length-1;i++){
+    for(const n of cols[i]){
+      n.links=cols[i+1].map((m,j)=>({m,j})).filter(o=>i===0||i+1===cols.length-1||Math.abs(o.m.lane-n.lane)<=1).map(o=>o.j);
+    }
+  }
+  return {cols,N};
+}
+
+function startRun(contract){
+  G.contract=contract; G.hireDept=0; G.sel=0; G.crew=[];
+  G.cands=DEPTS.map((_,d)=>Array.from({length:6},()=>newCandidate(d)));
+  G.screen='hire';
+}
+function launchVoyage(){
+  G.map=newMap(G.contract); G.cur={c:0,i:0}; G.choice=0;
+  // short-range sensors: first column always charted; scanner skill may reveal the second
+  for(const n of G.map.cols[1]) n.known=true;
+  if(G.map.cols[2]) for(const n of G.map.cols[2]) if(Math.random()<G.crew[3].skill/12) n.known=true;
+  G.ship={hull:100,shield:100,cargo:100,sys:{eng:100,wpn:100,scn:100,shg:100}};
+  G.t=0; G.bounty=0; G.fees=0; G.kills=0; G.log=[]; G.menu=-1; G.paused=false;
+  G.enemies=[]; G.rocks=[]; G.lasers=[]; G.parts=[]; G.stars=[];
+  for(let i=0;i<60;i++) G.stars.push({x:rnd(0,320),y:rnd(VP_TOP+1,VP_BOT-1),z:rnd(0.2,1)});
+  G.chatT=0; G.shake=0; G.shFlash=0;
+  addLog('CREW ABOARD. CARGO SEALED.',LGRN);
+  addLog('PRESS 1-5 TO GIVE A DEPARTMENT ORDERS.',GRY);
+  G.screen='map';
+}
+
+// ---------- log & chatter ----------
+function addLog(s,col=LGRY){ for(const l of wrap(s,40)) G.log.push({s:l,col}); while(G.log.length>30) G.log.shift(); }
+function say(c,ev,force){
+  if(!c||c.dead) return; const set=LINES[c.temper][ev]; if(!set) return;
+  if(!force){ if(G.chatT>0) return; if(Math.random()>(c.quirk==='CHATTY'?0.9:0.5)) return; }
+  G.chatT=2.5; addLog(c.name+': '+pick(set),CYN);
+}
+function crewReact(ev){const live=G.crew.filter(c=>!c.dead); if(live.length) say(pick(live),ev);}
+
+// ---------- crew performance ----------
+function eff(d){const c=G.crew[d]; if(c.dead) return 0.15; if(c.panicT>0) return 0.05;
+  let e=(0.25+0.75*c.skill/9)*(0.4+0.6*c.hp/100); if(c.quirk==='GAMBLER') e*=0.55+Math.random()*0.9; return Math.min(1.15,e);}
+function reliable(d){const c=G.crew[d]; return Math.random()>(c.dead?0.1:(9-c.rel)*0.025);}
+function ord(d){const c=G.crew[d]; if(!c.dead&&c.rogueT>0) return ROGUE[d]; return c.order;}
+function power(){const m=PM[ord(1)]; const pe=0.6+0.5*eff(1); return {sh:m[0]*pe,wp:m[1]*pe,en:m[2]*pe};}
+function diff(){const col=G.phase==='cruise'?G.tc:G.cur.c; const t=G.contract.tier; return col*(0.9+0.3*t)+t*1.2;}
+
+function injure(c,amt){
+  if(!c||c.dead) return; if(c.quirk==='TOUGH') amt*=0.5; if(c.quirk==='FRAIL') amt*=1.8;
+  c.hp=Math.round(c.hp-amt);
+  const d=G.crew.indexOf(c);
+  if(c.hp<=0){c.hp=0;c.dead=true;c.panicT=0;c.rogueT=0; addLog(c.name+' ('+DEPTS[d].k+') IS DEAD. STATION ON AUTO.',LRED); SFX.alarm();}
+  else {addLog(c.name+' ('+DEPTS[d].k+') INJURED - '+c.hp+'%',ORG); say(c,'hurt',true);}
+}
+function sysFail(){
+  const S=G.ship; const k=pick(['eng','wpn','scn','shg']); const a=ri(25,50);
+  S.sys[k]=Math.max(0,S.sys[k]-a); addLog(SYSN[k]+' FAULT! -'+a+'%',ORG); SFX.fail();
+  if(Math.random()<0.18) injure(G.crew[1],ri(10,25));
+}
+
+function damageShip(dmg){
+  const S=G.ship; let over=dmg;
+  if(S.shield>0){const a=Math.min(S.shield,dmg); S.shield-=a; over=dmg-a; G.shFlash=0.25;}
+  if(over>0.5){
+    S.hull-=over*0.9; S.cargo=Math.max(0,S.cargo-over*0.35); G.shake=Math.min(6,2+over*0.3); SFX.hit();
+    if(Math.random()<0.55){const k=pick(['eng','wpn','scn','shg']); const before=S.sys[k];
+      S.sys[k]=Math.max(0,S.sys[k]-over*rnd(0.8,1.8)); if(before>0&&S.sys[k]===0) addLog(SYSN[k]+' OFFLINE!',LRED);}
+    if(Math.random()<0.28+over*0.01){const live=G.crew.filter(c=>!c.dead); if(live.length) injure(pick(live),over*rnd(1.2,3));}
+    crewReact('hit');
+    if(S.hull<=0){S.hull=0; shipDestroyed(); return;}
+  } else SFX.shield();
+  for(const c of G.crew){
+    if(c.dead||c.panicT>0||c.temper!=='NERVOUS'||c.quirk==='VETERAN') continue;
+    if(Math.random()<0.10*(over>0.5?1.6:0.6)*(1.25-c.rel/9)){c.panicT=rnd(3,6); say(c,'panic',true); addLog(c.name+' IS PANICKING!',YEL);}
+  }
+}
+
+// ---------- particles ----------
+function burst(x,y,n,cols,sp=40){for(let i=0;i<n;i++){const a=rnd(0,6.283),v=rnd(5,sp);G.parts.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,t:rnd(0.3,0.9),col:pick(cols)});}}
+
+// ---------- flight flow ----------
+function beginLeg(ci){
+  const next=G.map.cols[G.cur.c+1]; const ni=G.map.cols[G.cur.c][G.cur.i].links[ci];
+  G.tc=G.cur.c+1; G.ti=ni; G.prog=0; G.phase='cruise'; G.screen='flight'; G.menu=-1;
+  addLog('JUMPING TO LEG '+G.tc+' OF '+G.map.N+'.',WHT); musicStop();
+}
+function arrive(){
+  G.cur={c:G.tc,i:G.ti}; const n=G.map.cols[G.tc][G.ti]; n.known=true; n.visited=true; startEvent(n.type);
+}
+function startEvent(type){
+  const d=diff(); G.event=type; G.phase='event';
+  if(type==='P'){
+    const n=1+(d>3.5?1:0)+(d>7&&Math.random()<0.5?1:0);
+    G.enemies=[]; const warn=ord(3)==='THREAT WARN'?1.6*eff(3)*G.ship.sys.scn/100:0;
+    for(let k=0;k<n;k++){const hp=Math.round(30+6*d+rnd(0,8));
+      G.enemies.push({hp,max:hp,wpn:1,eng:1,fireT:rnd(1.2,2.4)+warn+k*0.6,x:340+k*20,tx:226+k*30,y:18+k*22,bob:rnd(0,6),flash:0,dead:false});}
+    G.flee=0; G.analyze=0; G.fireT=1.0; G.idleWarn=false;
+    addLog('ALERT: '+n+' PIRATE RAIDER'+(n>1?'S':'')+' CLOSING!',LRED); SFX.alarm(); crewReact('enemy');
+  } else if(type==='A'){
+    G.eventT=15; G.spawnT=0.5; G.rocks=[]; addLog('ENTERING ASTEROID FIELD.',ORG); SFX.alarm(); crewReact('rocks');
+  } else if(type==='X'){
+    G.eventT=12; G.spawnT=1.2; addLog('ION STORM! SYSTEMS AT RISK.',PUR); SFX.alarm(); crewReact('storm');
+  } else if(type==='S'){
+    const S=G.ship; S.hull=Math.min(100,S.hull+30); for(const k in S.sys) S.sys[k]=Math.min(100,S.sys[k]+40); S.shield=100;
+    G.fees+=250; G.eventT=3.5; addLog('DOCKED. REPAIRS DONE. FEE $250.',LGRN); SFX.sel(); crewReact('dock');
+  } else if(type==='Q'){
+    G.eventT=2.2; addLog('QUIET SPACE. NOTHING ON SCOPE.',GRY); crewReact('quiet');
+  } else if(type==='D'){
+    G.eventT=3; addLog('ARRIVED AT '+G.contract.port+'. UNLOADING.',YEL); SFX.win();
+  }
+}
+function endEvent(){G.phase='after'; G.afterT=1.6;}
+function shipDestroyed(){
+  G.phase='dead'; G.deadT=3; G.menu=-1; burst(SHIP_X+12,SHIP_Y+5,80,[YEL,ORG,LRED,WHT,RED],70); SFX.boom(); SFX.lose();
+  addLog('HULL BREACH. SHIP LOST.',LRED);
+}
+function finishDelivery(){
+  const c=G.contract, S=G.ship; const payout=Math.round(c.pay*S.cargo/100); const sal=G.crew.reduce((a,x)=>a+x.salary,0);
+  const profit=payout+G.bounty-G.fees-sal;
+  G.result={payout,sal,profit,cargo:Math.round(S.cargo)};
+  const qualifies=G.scores.length<10||profit>G.scores[G.scores.length-1].p;
+  G.nameBuf=''; G.screen=qualifies&&profit>0?'name':'result'; G.resultQualifies=qualifies&&profit>0;
+}
+
+// ---------- per-frame simulation ----------
+function flightUpdate(dt){
+  const S=G.ship; G.t+=dt; G.chatT-=dt; G.shake=Math.max(0,G.shake-dt*12); G.shFlash-=dt;
+  for(const c of G.crew){
+    if(c.panicT>0){c.panicT-=dt; if(c.panicT<=0) say(c,'recover',true);}
+    if(c.rogueT>0){c.rogueT-=dt; if(c.rogueT<=0) addLog(c.name+' FALLS BACK IN LINE.',GRY);}
+  }
+  const moving=G.phase==='cruise';
+  for(const s of G.stars){s.x-=s.z*(moving?90:14)*dt; if(s.x<0){s.x=320;s.y=rnd(VP_TOP+1,VP_BOT-1);}}
+  for(const p of G.parts){p.x+=p.vx*dt;p.y+=p.vy*dt;p.t-=dt;} G.parts=G.parts.filter(p=>p.t>0);
+  for(const l of G.lasers) l.t-=dt; G.lasers=G.lasers.filter(l=>l.t>0);
+  if(G.phase==='dead'){G.deadT-=dt; if(G.deadT<=0){G.screen='gameover';} return;}
+
+  const pw=power();
+  S.shield=Math.min(100,S.shield+dt*5.5*pw.sh*S.sys.shg/100);
+  repairTick(dt);
+  if(moving&&ord(3)==='CHART ROUTE') chartTick(dt);
+  if(G.phase==='event'&&G.event==='P') stressTick(dt);
+
+  if(G.phase==='cruise'){
+    let sp=0.085*(0.4+0.6*S.sys.eng/100)*pw.en; const n=ord(0);
+    if(n==='FULL SPEED') sp*=1.35; if(n==='EVADE') sp*=0.9;
+    G.prog+=dt*sp;
+    if(Math.random()<dt*(0.006+0.0015*diff())*(1.3-0.7*eff(1))) sysFail();
+    if(G.prog>=1) arrive();
+  } else if(G.phase==='event'){
+    if(G.event==='P') combatTick(dt,pw);
+    else if(G.event==='A') rockTick(dt,pw);
+    else if(G.event==='X') stormTick(dt);
+    else {G.eventT-=dt; if(G.eventT<=0){ if(G.event==='D') finishDelivery(); else endEvent(); }}
+  } else if(G.phase==='after'){
+    for(const e of G.enemies) if(e.leaving) e.x+=dt*120;
+    G.afterT-=dt; if(G.afterT<=0){G.screen='map'; G.choice=0; G.menu=-1; G.enemies=[]; G.rocks=[];}
+  }
+}
+function repairTick(dt){
+  const S=G.ship; const val=k=>k==='hull'?S.hull:S.sys[k]; let k=REP_KEYS[ord(4)]; let mult=1;
+  if(val(k)>=100){ k=['hull','shg','wpn','eng','scn'].sort((a,b)=>val(a)-val(b))[0]; if(val(k)>=100) return; mult=0.5; }
+  const c=G.crew[4]; const relF=c.dead?0.9:1-(9-c.rel)*0.025;
+  const rate=(k==='hull'?1.3:4.5)*eff(4)*relF*mult*dt;
+  if(k==='hull') S.hull=Math.min(100,S.hull+rate); else S.sys[k]=Math.min(100,S.sys[k]+rate);
+}
+function chartTick(dt){
+  if(Math.random()<dt*0.22*eff(3)*G.ship.sys.scn/100){
+    const cand=[]; for(let i=G.tc;i<=Math.min(G.map.N,G.tc+2);i++) for(const n of G.map.cols[i]) if(!n.known) cand.push(n);
+    if(cand.length){pick(cand).known=true; addLog('SCANNERS: CHARTED A NODE AHEAD.',LBLU);}
+  }
+}
+function stressTick(dt){
+  G.crew.forEach((c,d)=>{
+    if(c.dead||c.panicT>0||c.rogueT>0) return;
+    if(c.temper==='HOTHEAD'&&c.order!==ROGUE[d]&&Math.random()<dt*0.045*(1.3-c.rel/9)){
+      c.rogueT=rnd(4,7); say(c,'rogue',true); addLog(c.name+' IGNORES ORDERS: '+ROGUE[d]+'!',YEL);
+    }
+    if(c.temper==='NERVOUS'&&c.quirk!=='VETERAN'&&Math.random()<dt*0.012*(1.25-c.rel/9)){
+      c.panicT=rnd(3,5); say(c,'panic',true); addLog(c.name+' IS PANICKING!',YEL);
+    }
+  });
+}
+function combatTick(dt,pw){
+  const S=G.ship, d=diff();
+  for(const e of G.enemies){
+    e.x+=(e.tx-e.x)*Math.min(1,dt*2); e.bob+=dt; e.flash-=dt; if(e.dead) continue;
+    e.fireT-=dt*(0.6+0.4*e.eng);
+    if(e.fireT<=0){e.fireT=Math.max(1.3,2.5-0.06*d)*rnd(0.85,1.2); enemyFire(e,d,pw); if(G.phase!=='event') return;}
+  }
+  if(ord(3)==='ANALYZE') G.analyze=Math.min(0.25,G.analyze+dt*0.02*eff(3)*S.sys.scn/100);
+  if(ord(2)==='ASTEROIDS'){ if(!G.idleWarn){G.idleWarn=true; addLog('WEAPONS IDLE: SET TO ASTEROIDS.',GRY);} }
+  else if(S.sys.wpn>8){ G.fireT-=dt*(0.5+0.5*pw.wp)*(S.sys.wpn/100); if(G.fireT<=0){G.fireT=1.7; playerFire(pw);} }
+  if(ord(0)==='FLEE'){
+    const live=G.enemies.filter(e=>!e.dead); const ee=live.reduce((a,e)=>a+e.eng,0)/Math.max(1,live.length);
+    G.flee+=dt*9*eff(0)*pw.en*(S.sys.eng/100)/Math.max(0.25,ee);
+    if(G.flee>=100){addLog('WE BROKE AWAY! PIRATES LEFT BEHIND.',LGRN); SFX.sel(); G.enemies.forEach(e=>{e.leaving=true;}); endEvent(); return;}
+  }
+  if(G.enemies.length&&G.enemies.every(e=>e.dead)){addLog('ALL RAIDERS DESTROYED.',LGRN); endEvent();}
+}
+function enemyFire(e,d,pw){
+  const S=G.ship, n=ord(0); let hc=0.62+0.015*d; const engF=Math.min(1.2,(S.sys.eng/100)*pw.en);
+  if(n==='EVADE') hc-=0.32*eff(0)*engF; if(n==='FULL SPEED') hc+=0.05; if(n==='HOLD STEADY') hc+=0.06; if(n==='FLEE') hc-=0.1*eff(0)*engF;
+  if(ord(3)==='THREAT WARN') hc-=0.12*eff(3)*S.sys.scn/100;
+  if(G.crew.some(c=>!c.dead&&c.quirk==='LUCKY')) hc-=0.04;
+  const hit=Math.random()<clamp(hc,0.08,0.92);
+  const ey=e.y+4+Math.sin(e.bob*2)*2;
+  G.lasers.push({x0:e.x,y0:ey,x1:SHIP_X+14,y1:hit?SHIP_Y+5:SHIP_Y+(Math.random()<.5?-12:22),col:PUR,t:0.18});
+  SFX.elaser();
+  if(hit) damageShip((5+d*0.9+rnd(0,4+d*0.4))*e.wpn);
+}
+function playerFire(pw){
+  const S=G.ship; const live=G.enemies.filter(e=>!e.dead); if(!live.length) return; const e=live[0];
+  if(!reliable(2)){addLog(G.crew[2].dead?'AUTO-GUNNER MISFIRE.':G.crew[2].name+': MISFIRE!',GRY); return;}
+  let hc=0.42+0.38*eff(2)+G.analyze-0.08*e.eng; const n=ord(0);
+  if(n==='HOLD STEADY') hc+=0.15*eff(0); if(n==='EVADE') hc-=0.08; if(n==='FLEE') hc-=0.15;
+  const hit=Math.random()<clamp(hc,0.05,0.95); const ey=e.y+4+Math.sin(e.bob*2)*2;
+  G.lasers.push({x0:SHIP_X+24,y0:SHIP_Y+5,x1:hit?e.x+8:e.x+ri(-10,30),y1:hit?ey:ey+(Math.random()<.5?-12:14),col:LRED,t:0.14});
+  SFX.laser();
+  if(!hit) return;
+  let dm=rnd(8,14)*(0.5+0.5*pw.wp)*(0.3+0.7*S.sys.wpn/100); const t=ord(2);
+  if(G.crew[2].quirk==='LUCKY'&&!G.crew[2].dead&&Math.random()<0.12){dm*=2; addLog('CRITICAL HIT!',YEL);}
+  if(t==='TGT HULL') dm*=1.35; else if(t==='TGT WEAPONS'){dm*=0.75; e.wpn=Math.max(0.35,e.wpn-0.12);} else if(t==='TGT ENGINES'){dm*=0.75; e.eng=Math.max(0.25,e.eng-0.15);}
+  e.hp-=dm; e.flash=0.12; burst(e.x+6,ey,6,[YEL,WHT,ORG],25);
+  if(e.hp<=0){e.dead=true; e.hp=0; const b=Math.round((120+25*diff())/10)*10; G.bounty+=b; G.kills++;
+    burst(e.x+10,ey,45,[YEL,ORG,LRED,WHT],60); SFX.boom(); addLog('RAIDER DESTROYED. BOUNTY '+money(b)+'.',LGRN); crewReact('kill');}
+}
+function rockTick(dt,pw){
+  const S=G.ship, d=diff(), n=ord(0);
+  G.eventT-=dt*(n==='FULL SPEED'?1.8:1); G.spawnT-=dt;
+  if(G.eventT>0&&G.spawnT<=0){
+    G.spawnT=Math.max(0.45,0.8-0.02*d)*rnd(0.7,1.3);
+    let shot=ord(2)==='ASTEROIDS'&&S.sys.wpn>8&&Math.random()<0.55*eff(2)*(S.sys.wpn/100)*(0.6+0.4*pw.wp);
+    const engF=Math.min(1.2,(S.sys.eng/100)*pw.en);
+    let hc=0.42+0.012*d; if(n==='EVADE') hc-=0.25*eff(0)*engF; if(ord(3)==='ROCK TRACK') hc-=0.2*eff(3)*S.sys.scn/100; if(n==='FULL SPEED') hc+=0.12;
+    const out=shot?'shot':(Math.random()<clamp(hc,0.05,0.9)?'hit':'miss');
+    let y=rnd(VP_TOP+6,VP_BOT-10); if(out==='miss'&&Math.abs(y-(SHIP_Y+5))<14) y=y<SHIP_Y+5?SHIP_Y-12:SHIP_Y+24;
+    G.rocks.push({x:330,y,sz:ri(3,6),v:rnd(70,110)*(n==='FULL SPEED'?1.5:1),out,done:false,spin:rnd(0,6)});
+  }
+  for(const r of G.rocks){
+    r.x-=r.v*dt; r.spin+=dt;
+    if(r.out==='hit') r.y+=((SHIP_Y+5)-r.y)*Math.min(1,dt*1.5);
+    if(!r.done&&r.out==='shot'&&r.x<200){r.done=true; r.gone=true; G.lasers.push({x0:SHIP_X+24,y0:SHIP_Y+5,x1:r.x,y1:r.y,col:LRED,t:0.12}); SFX.laser(); burst(r.x,r.y,14,[BRN,ORG,GRY],35); SFX.rock();}
+    if(!r.done&&r.out==='hit'&&r.x<SHIP_X+22){r.done=true; r.gone=true; burst(r.x,r.y,16,[BRN,ORG,GRY,WHT],40); SFX.rock(); damageShip(4+rnd(0,5)+0.4*d); if(G.phase!=='event') return;}
+  }
+  G.rocks=G.rocks.filter(r=>!r.gone&&r.x>-12);
+  if(G.eventT<=0&&G.rocks.length===0){addLog('CLEAR OF THE FIELD.',LGRN); endEvent();}
+}
+function stormTick(dt){
+  const S=G.ship, d=diff(); G.eventT-=dt; G.spawnT-=dt;
+  if(G.spawnT<=0){G.spawnT=1.4; G.bolt=0.15;
+    let p=0.5+0.02*d; if(ord(3)==='THREAT WARN') p-=0.35*eff(3)*S.sys.scn/100;
+    if(Math.random()<p){sysFail(); S.shield=Math.max(0,S.shield-15);} else noise({dur:0.15,vol:0.15,f:6000,f1:2000});}
+  G.bolt=(G.bolt||0)-dt;
+  if(G.eventT<=0){addLog('STORM PASSED.',LGRN); endEvent();}
+}
+
+// ---------- rendering ----------
+function cls(col){rect(0,0,W,H,col);}
+function hline(y,col){rect(0,y,W,1,col);}
+
+function drawTitle(){
+  cls(BLK); const f=G.frame;
+  for(const s of G.tstars){s.x-=s.z*0.8; if(s.x<0){s.x=320;s.y=rnd(0,200);} rect(s.x,s.y,1,1,s.z>0.7?WHT:s.z>0.4?GRY:DGRY);}
+  const RB=[BLU,LBLU,CYN,WHT,CYN,LBLU,BLU,PUR,LRED,YEL,WHT,YEL,LRED,PUR];
+  for(let y=0;y<10;y++){rect(0,14+y,W,1,RB[(y+(f>>2))%RB.length]); rect(0,66+y,W,1,RB[(y+20-(f>>2))%RB.length]);}
+  const T='EAGTC';
+  for(let i=0;i<T.length;i++){ const yy=29+Math.round(Math.sin(f*0.06+i*0.6)*3); txtPx(80+i*32+2,yy+2,T[i],BLU,4); txtPx(80+i*32,yy,T[i],[YEL,WHT,CYN,LGRN,YEL][(i+(f>>4))%5],4);}
+  ctr(10,'EASTERN ARIES',WHT); ctr(11,'GALACTIC TRADING COMPANY',WHT);
+  ctr(13,'FIVE ALIENS. ONE CARGO. NO REFUNDS.',LGRY);
+  const sx=((f*0.9)%420)-40; ctx.drawImage(SPR_SHIP,sx|0,116);
+  for(let i=0;i<3;i++) rect(sx-2-i*2-(f%3),121,2,1,[YEL,ORG,RED][i]);
+  ctr(16,'SPACE  START A RUN',WHT); ctr(17,'I      HOW TO PLAY',LGRY); ctr(18,'H      HIGH PROFITS',LGRY); ctr(19,'M      SOUND '+(AU.on?'ON ':'OFF'),LGRY);
+  if((f>>5)%2===0) ctr(22,'CLICK SCREEN, THEN PRESS A KEY',GRY);
+  ctr(24,'EAGTC - 2026',DGRY);
+}
+function drawHelp(){
+  cls(BLU); txt(0,0,pad(' HOW TO PLAY',40),BLU,LBLU);
+  const L=[
+    ['PICK A CONTRACT. BIGGER PAY = MORE',WHT],['PIRATES ON THE ROUTE.',WHT],['',0],
+    ['HIRE ONE ALIEN FOR EACH DEPARTMENT:',WHT],[' NAV ENG WPN SCN REP',YEL],
+    ['SKILL IS SHOWN. TEMPER IS NOT - READ',LGRY],['WHAT THEY SAY IN THE INTERVIEW.',LGRY],['',0],
+    ['CHOOSE JUMPS ON THE STAR MAP. EACH',WHT],['LEG RUNS IN REAL TIME. PRESS 1-5,',WHT],['THEN A-E, TO SET A DEPARTMENT ORDER.',WHT],
+    ['CREW MAY PANIC, IGNORE ORDERS, GET',LGRY],['HURT OR DIE. NO REPLACEMENTS.',LGRY],['',0],
+    ['DELIVER THE CARGO. PROFIT IS PAY X',WHT],['CARGO CONDITION + BOUNTIES - FEES',WHT],['- CREW SALARIES.',WHT],['',0],
+    ['P PAUSES. M TOGGLES SOUND.',CYN],
+  ];
+  L.forEach((l,i)=>txt(1,2+i,l[0],l[1]));
+  ctr(24,'PRESS SPACE',YEL);
+}
+function drawScores(hl){
+  cls(BLU); txt(0,0,pad(' HIGHEST PROFIT RUNS',40),BLU,LBLU);
+  txt(4,3,'RANK  CAPTAIN       PROFIT',YEL);
+  for(let i=0;i<10;i++){const s=G.scores[i]; const col=i===hl?(G.frame>>3)%2?YEL:WHT:LGRY;
+    txt(4,5+i,lpad(i+1,3)+'.  '+(s?pad(s.n,10):pad('----------',10))+'  '+(s?lpad(money(s.p),8):'        '),col);}
+  txt(2,22,'SCORES ARE SAVED IN THIS BROWSER ONLY.',GRY);
+  ctr(24,'PRESS SPACE',YEL);
+}
+function drawContracts(){
+  cls(BLU); txt(0,0,pad(' FREIGHT BOARD - CHOOSE A CONTRACT',40),BLU,LBLU);
+  G.contracts.forEach((c,i)=>{const y=3+i*6; const L='ABC'[i];
+    txt(1,y,L,BLU,YEL); txt(3,y,c.cargo,WHT);
+    txt(3,y+1,'TO '+c.port,LGRY);
+    txt(3,y+2,'JUMPS '+c.jumps+'   PAY '+money(c.pay),LGRN);
+    txt(3,y+3,'CARGO VALUE ',LGRY); txt(15,y+3,['LOW','MEDIUM','HIGH'][c.tier],[LGRN,YEL,LRED][c.tier]);
+    txt(23,y+3,'RISK '+'*'.repeat(c.tier+1+(c.jumps>6?1:0)),[LGRN,YEL,LRED][c.tier]);
+  });
+  txt(1,21,'PAY IS CUT BY CARGO DAMAGE. CREW',GRY); txt(1,22,'SALARIES COME OUT OF YOUR PROFIT.',GRY);
+  txt(0,24,pad(' A B C CHOOSE    ESC TITLE',40),BLU,LBLU);
+}
+function drawHire(){
+  cls(BLU); const d=G.hireDept, D=DEPTS[d];
+  txt(0,0,pad(' HIRE '+D.name+' HEAD ('+(d+1)+'/5)',40),BLU,LBLU);
+  txt(1,1,'NAME     SPECIES  SKL REF   SALARY',GRY);
+  G.cands[d].forEach((c,i)=>{const y=2+i*2; const s=i===G.sel;
+    if(s) rect(0,y*8,W,16,DGRY);
+    txt(0,y,s?'>':' ',YEL);
+    txt(1,y,pad(c.name,8)+' '+pad(c.species,8)+'  '+c.skill+'  '+pad(refWord(c.rel),4)+'  '+lpad(money(c.salary),5),s?WHT:LGRY);
+    txt(2,y+1,'"'+c.quote.slice(0,35)+'"',s?CYN:GRY);
+  });
+  const c=G.cands[d][G.sel];
+  txt(1,15,'INTERVIEW: '+c.name+' THE '+c.species,YEL);
+  wrap('"'+c.quote+(c.qhint?' '+c.qhint:'')+'"',38).slice(0,3).forEach((l,i)=>txt(1,16+i,l,CYN));
+  txt(1,19,'SKILL ',LGRY); bar(56,152,72,c.skill/9*100,valCol(c.skill/9*100)); txt(18,19,'REFERENCES '+refWord(c.rel),LGRY);
+  rect(0,165,W,1,LBLU);
+  for(let i=0;i<5;i++){const h=G.crew[i]; txt(1+i*8,21,DEPTS[i].k,i===d?YEL:GRY); txt(1+i*8,22,h?pad(h.name,7):(i===d?'?':'-'),h?LGRN:GRY);}
+  const tot=G.crew.reduce((a,x)=>a+x.salary,0)+c.salary;
+  txt(1,23,'PAYROLL '+money(tot)+'  CONTRACT '+money(G.contract.pay),LGRY);
+  txt(0,24,pad(' UP/DOWN PICK  RETURN HIRE  ESC BACK',40),BLU,LBLU);
+}
+function nodeXY(c,lane){const N=G.map.N; return {x:Math.round(14+c*(290/N)), y:28+lane*30};}
+function drawMap(){
+  cls(BLK); const M=G.map, f=G.frame;
+  txt(0,0,pad(' STAR MAP - LEG '+G.cur.c+'/'+M.N+'  '+G.contract.cargo,40),BLU,LBLU);
+  txt(1,1,'TO '+G.contract.port,GRY);
+  // links
+  for(let c=0;c<M.cols.length-1;c++) M.cols[c].forEach((n,i)=>{ const a=nodeXY(c,n.lane);
+    n.links.forEach(j=>{const m=M.cols[c+1][j]; const b=nodeXY(c+1,m.lane);
+      const travelled=n.visited&&m.visited; const avail=c===G.cur.c&&i===G.cur.i;
+      const steps=Math.max(Math.abs(b.x-a.x),Math.abs(b.y-a.y));
+      for(let s=4;s<steps-4;s+=(travelled?1:3)){const x=a.x+(b.x-a.x)*s/steps, y=a.y+(b.y-a.y)*s/steps; rect(x,y,1,1,travelled?LGRN:avail?LBLU:DGRY);}
+    });});
+  const curN=M.cols[G.cur.c][G.cur.i]; const opts=curN.links; const selJ=opts[G.choice];
+  M.cols.forEach((col,c)=>col.forEach((n,i)=>{
+    const p=nodeXY(c,n.lane); const ch=n.known?NODE_CH[n.type]:'?'; const cc=n.known?NODE_COL[n.type]:WHT;
+    const isCur=c===G.cur.c&&i===G.cur.i, isSel=c===G.cur.c+1&&i===selJ, isOpt=c===G.cur.c+1&&opts.includes(i);
+    let bg=DGRY; if(n.visited) bg=GRN; if(isOpt) bg=BLU; if(isSel) bg=(f>>3)%2?LBLU:BLU; if(isCur) bg=YEL;
+    rect(p.x-5,p.y-5,10,10,bg); txtPx(p.x-4,p.y-4,ch,isCur?BLK:cc);
+    if(isCur){ctx.drawImage(SPR_SHIP,p.x-12,p.y+7);}
+  }));
+  // info
+  rect(0,124,W,1,LBLU);
+  const sel=M.cols[G.cur.c+1][selJ]; const t=sel.known?sel.type:'?';
+  txt(1,16,'NEXT JUMP: ',LGRY); txt(12,16,NODE_NAME[t],NODE_COL[t]);
+  const S=G.ship;
+  txt(1,17,'HULL',LGRY); bar(40,136,48,S.hull,valCol(S.hull)); txt(12,17,'CARGO',LGRY); bar(144,136,48,S.cargo,valCol(S.cargo));
+  txt(25,17,'BOUNTY '+money(G.bounty),LGRN);
+  txt(1,18,'ENG'+lpad(Math.round(S.sys.eng),3)+' WPN'+lpad(Math.round(S.sys.wpn),3)+' SCN'+lpad(Math.round(S.sys.scn),3)+' SHG'+lpad(Math.round(S.sys.shg),3),GRY);
+  G.crew.forEach((c,i)=>{ const x=1+i*8; txt(x,20,DEPTS[i].k,YEL); txt(x,21,pad(c.name,7),c.dead?DGRY:WHT);
+    txt(x,22,c.dead?'DEAD':c.hp+'%',c.dead?RED:valCol(c.hp)); });
+  txt(0,23,'P PIRATES A ROCKS X STORM S DOCK . QUIET',DGRY);
+  txt(0,24,pad(' UP/DOWN ROUTE   RETURN JUMP',40),BLU,LBLU);
+}
+function drawFlight(){
+  cls(BLK); const S=G.ship, f=G.frame;
+  ctx.save(); const sh=G.shake>0?ri(-1,1)*Math.ceil(G.shake/2):0; ctx.translate(sh,G.shake>0?ri(-1,1):0);
+  ctx.beginPath(); ctx.rect(0,VP_TOP,W,VP_BOT-VP_TOP); ctx.clip();
+  if(G.event==='X'&&G.phase==='event'){ if(G.bolt>0) rect(0,VP_TOP,W,VP_BOT-VP_TOP,PUR); else for(let i=0;i<12;i++) rect(ri(0,319),ri(VP_TOP,VP_BOT),ri(4,30),1,(i%2)?PUR:BLU);}
+  for(const s of G.stars){const len=G.phase==='cruise'?Math.ceil(s.z*5):1; rect(s.x,s.y,len,1,s.z>0.7?WHT:s.z>0.4?GRY:DGRY);}
+  if(G.event==='S'&&G.phase!=='cruise') ctx.drawImage(SPR_DOCK,70,SHIP_Y-0);
+  // ship
+  if(G.phase!=='dead'){
+    const by=SHIP_Y+Math.round(Math.sin(G.t*2)*1.5);
+    for(let i=0;i<3;i++) rect(SHIP_X-2-i*2-(f%3),by+5,2,1,[YEL,ORG,RED][i]);
+    ctx.drawImage(SPR_SHIP,SHIP_X,by);
+    if(G.shFlash>0){ctx.strokeStyle=PAL[CYN];ctx.beginPath();ctx.ellipse(SHIP_X+12,by+5,17,10,0,0,6.283);ctx.stroke();}
+  }
+  for(const e of G.enemies){ if(e.dead) continue; const ey=e.y+Math.round(Math.sin(e.bob*2)*2);
+    ctx.drawImage(SPR_PIR,e.x|0,ey); if(e.flash>0) rect(e.x+6,ey+3,6,3,WHT);
+    bar(e.x,ey-8,20,e.hp/e.max*100,LRED); }
+  for(const r of G.rocks){ const s=r.sz; rect(r.x-s,r.y-s+1,s*2,s*2-2,BRN); rect(r.x-s+1,r.y-s,s*2-2,s*2,BRN); rect(r.x-s+1,r.y-s+1,s,s-1,ORG); rect(r.x+((r.spin*3|0)%s)-1,r.y,2,2,DGRY);}
+  for(const l of G.lasers){ctx.strokeStyle=PAL[(f>>1)%2?l.col:WHT]; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(l.x0+.5,l.y0+.5); ctx.lineTo(l.x1+.5,l.y1+.5); ctx.stroke();}
+  for(const p of G.parts) rect(p.x,p.y,p.t>0.5?2:1,p.t>0.5?2:1,p.col);
+  ctx.restore();
+  // viewport overlays
+  let ev='';
+  if(G.phase==='cruise'){ ev='IN TRANSIT'; txt(1,9,'LEG '+G.tc+'/'+G.map.N,GRY); bar(64,72,120,G.prog*100,LBLU); const nn=G.map.cols[G.tc][G.ti]; txt(24,9,nn.known?NODE_NAME[nn.type]:'UNCHARTED',nn.known?NODE_COL[nn.type]:WHT);}
+  else if(G.phase==='event'||G.phase==='after'){ ev=NODE_NAME[G.event];
+    if(G.event==='P'){const live=G.enemies.filter(e=>!e.dead).length; txt(1,1,'RAIDERS '+live,LRED); if(ord(0)==='FLEE') {txt(14,1,'ESCAPE',LGRN); bar(168,8,60,G.flee,LGRN);} if(G.analyze>0.02) txt(30,1,'AIM +'+Math.round(G.analyze*100)+'%',LBLU);}
+    if(G.event==='A'||G.event==='X') {txt(1,1,(G.event==='A'?'FIELD ':'STORM ')+Math.max(0,Math.ceil(G.eventT))+'S',G.event==='A'?ORG:PUR);}
+  } else if(G.phase==='dead') { ev='SHIP LOST'; if((f>>3)%2) ctr(5,'*** HULL BREACH ***',LRED); }
+  if(G.paused&&(f>>4)%2) ctr(5,' PAUSED - P TO RESUME ',BLK,YEL);
+  const tt=Math.floor(G.t); txt(0,0,pad(' LEG '+(G.phase==='cruise'?G.tc:G.cur.c)+'/'+G.map.N+' '+pad(ev,15)+' T'+String(Math.floor(tt/60)).padStart(2,'0')+':'+String(tt%60).padStart(2,'0')+' $'+G.bounty,40),BLU,LBLU);
+  // ship status
+  txt(0,10,'HULL',LGRY); bar(34,80,44,S.hull,valCol(S.hull));
+  txt(10,10,'SHLD',LGRY); bar(114,80,44,S.shield,CYN);
+  txt(20,10,'CRGO',LGRY); bar(194,80,44,S.cargo,valCol(S.cargo));
+  const pw=power(); txt(31,10,'PWR',GRY); const pws=[pw.sh,pw.wp,pw.en];
+  pws.forEach((v,i)=>rect(272+i*12,88-Math.round(v*4),8,Math.round(v*4),[CYN,LRED,YEL][i]));
+  [['ENG','eng'],['WPN','wpn'],['SCN','scn'],['SHG','shg']].forEach(([n,k],i)=>{txt(i*10,11,n,GRY); txt(i*10+4,11,lpad(Math.round(S.sys[k]),3)+'%',valCol(S.sys[k]));});
+  hline(103,LBLU);
+  // crew
+  G.crew.forEach((c,d)=>{ const y=13+d; const o=ord(d); const rogue=!c.dead&&c.rogueT>0;
+    if(G.menu===d) rect(0,y*8,W,8,DGRY);
+    txt(0,y,String(d+1),YEL); txt(2,y,DEPTS[d].k,LBLU); txt(6,y,pad(c.name,8),c.dead?DGRY:WHT);
+    txt(15,y,pad(c.dead?'AUTO':o,11),rogue?LRED:c.dead?DGRY:LGRN);
+    if(!c.dead) bar(216,y*8,40,c.hp,valCol(c.hp));
+    let st='OK',sc=LGRN; if(c.dead){st='DEAD';sc=RED;} else if(c.panicT>0){st='PANIC';sc=(f>>3)%2?YEL:ORG;} else if(rogue){st='ROGUE';sc=LRED;} else if(c.hp<60){st='HURT';sc=ORG;}
+    txt(33,y,st,sc);
+  });
+  hline(143,LBLU);
+  // log or orders menu
+  if(G.menu>=0){ const D=DEPTS[G.menu], c=G.crew[G.menu];
+    txt(0,18,pad(' '+D.name+' ORDERS - '+(c.dead?'AUTO':c.name),40),BLK,CYN);
+    D.orders.forEach((o,i)=>{const x=i%2?20:0, y=19+Math.floor(i/2); const cur=c.order===o;
+      txt(x,y,(cur?'>':' ')+'ABCDE'[i]+' '+o,cur?YEL:WHT);});
+    const hov=c.order; txt(0,22,pad(G.menu===4?'REPAIR CREW WORKS ON THIS FIRST.':(ORDER_HELP[hov]||''),40),GRY);
+    txt(0,23,'ESC CLOSE',GRY);
+  } else {
+    const L=G.log.slice(-6); L.forEach((l,i)=>txt(0,18+i,l.s,l.col));
+  }
+  txt(0,24,pad(' 1-5 ORDERS  P PAUSE  M SOUND',40),BLU,LBLU);
+}
+function drawResult(){
+  cls(BLU); const r=G.result, c=G.contract;
+  txt(0,0,pad(' DELIVERY COMPLETE - '+c.port,40),BLU,LBLU);
+  const L=[
+    ['CONTRACT PAY',money(c.pay),WHT],
+    ['CARGO CONDITION',r.cargo+'%',valCol(r.cargo)],
+    ['CARGO PAYOUT',money(r.payout),WHT],
+    ['PIRATE BOUNTIES ('+G.kills+')','+'+money(G.bounty),LGRN],
+    ['DOCK FEES','-'+money(G.fees),LRED],
+    ['CREW SALARIES','-'+money(r.sal),LRED],
+  ];
+  L.forEach((l,i)=>{txt(3,3+i,l[0],LGRY); txt(36-l[1].length,3+i,l[1],l[2]);});
+  rect(24,80,272,1,WHT); txt(3,11,'PROFIT',YEL); const ps=money(r.profit); txt(36-ps.length,11,ps,r.profit>=0?YEL:LRED);
+  txt(3,13,'CREW REPORT',LBLU);
+  G.crew.forEach((x,i)=>txt(3,14+i,DEPTS[i].k+' '+pad(x.name,8)+' '+pad(x.species,9)+' '+(x.dead?'KILLED':x.hp<100?'INJURED '+x.hp+'%':'UNHURT'),x.dead?LRED:LGRY));
+  txt(3,20,'TIME '+Math.floor(G.t/60)+'M '+Math.floor(G.t%60)+'S',GRY);
+  ctr(24,'PRESS SPACE',YEL);
+}
+function drawName(){
+  drawResult(); rect(16,168,288,24,BLK); rect(16,168,288,1,YEL);
+  txt(3,21,'NEW HIGH PROFIT! ENTER YOUR NAME:',YEL);
+  txt(3,22,G.nameBuf+((G.frame>>4)%2?'_':' '),WHT);
+  txt(0,24,pad(' TYPE NAME, RETURN TO SAVE',40),BLU,LBLU);
+}
+function drawGameOver(){
+  cls(BLK); const f=G.frame;
+  for(let y=0;y<8;y++) rect(0,40+y,W,1,[RED,LRED,ORG,YEL,ORG,LRED,RED,BLK][(y+(f>>3))%8]);
+  txtPx(40,60,'SHIP LOST',LRED,3);
+  ctr(12,'THE '+G.contract.cargo,LGRY); ctr(13,'NEVER REACHED '+G.contract.port+'.',LGRY);
+  ctr(15,'LEGS COMPLETED: '+G.cur.c+' OF '+G.map.N,WHT);
+  ctr(16,'RAIDERS DESTROYED: '+G.kills,WHT);
+  ctr(17,'NO PROFIT RECORDED.',GRY);
+  ctr(24,'PRESS SPACE',YEL);
+}
+
+// ---------- input ----------
+function onKey(e){
+  auInit();
+  const k=e.key; const K=k.length===1?k.toUpperCase():k;
+  if([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Backspace','Enter','Escape'].includes(k)) e.preventDefault();
+  if(K==='M'&&G.screen!=='name'){setSound(!AU.on); if(AU.on&&['title','contracts','hire','help','scores'].includes(G.screen)) musicStart(); return;}
+  const sc=G.screen;
+  if(sc==='title'){
+    if(k===' '||k==='Enter'){SFX.sel(); G.contracts=newContracts(); G.screen='contracts';}
+    else if(K==='I'){SFX.key(); G.screen='help';}
+    else if(K==='H'){SFX.key(); G.hl=-1; G.screen='scores';}
+    musicStart();
+  } else if(sc==='help'||sc==='scores'){ if(k===' '||k==='Enter'||k==='Escape'){SFX.key(); G.screen='title';} }
+  else if(sc==='contracts'){
+    const i='ABC'.indexOf(K); if(i>=0){SFX.sel(); startRun(G.contracts[i]);} else if(k==='Escape'){G.screen='title';}
+  } else if(sc==='hire'){
+    if(k==='ArrowUp'){G.sel=(G.sel+5)%6;SFX.key();}
+    else if(k==='ArrowDown'){G.sel=(G.sel+1)%6;SFX.key();}
+    else if(k==='Enter'||k===' '){ SFX.sel(); const c=G.cands[G.hireDept][G.sel]; G.crew[G.hireDept]=c; G.hireDept++; G.sel=0;
+      if(G.hireDept>=5){ musicStop(); launchVoyage(); } }
+    else if(k==='Escape'||k==='Backspace'){ SFX.key(); if(G.hireDept===0) G.screen='contracts'; else {G.hireDept--; G.crew.length=G.hireDept; G.sel=0;} }
+  } else if(sc==='map'){
+    const n=G.map.cols[G.cur.c][G.cur.i].links.length;
+    if(k==='ArrowUp'||k==='ArrowLeft'){G.choice=(G.choice+n-1)%n;SFX.key();}
+    else if(k==='ArrowDown'||k==='ArrowRight'){G.choice=(G.choice+1)%n;SFX.key();}
+    else if(k==='Enter'||k===' '){SFX.sel(); beginLeg(G.choice);}
+  } else if(sc==='flight'){
+    if(G.phase==='dead') return;
+    if(K==='P'){G.paused=!G.paused; SFX.key(); return;}
+    if(k>='1'&&k<='5'){G.menu=+k-1; SFX.key(); return;}
+    if(k==='Escape'||k==='0'){G.menu=-1; return;}
+    if(G.menu>=0){ const i='ABCDE'.indexOf(K); const D=DEPTS[G.menu];
+      if(i>=0&&i<D.orders.length){ const c=G.crew[G.menu]; c.order=D.orders[i]; SFX.sel();
+        if(c.dead) addLog(D.k+' AUTO: '+c.order+'.',GRY);
+        else if(c.rogueT>0) addLog(c.name+' IGNORES YOU. STILL ROGUE.',LRED);
+        else addLog(D.k+' '+c.name+': '+c.order+'.',LBLU);
+        G.menu=-1; } }
+  } else if(sc==='name'){
+    if(k==='Enter'){ const nm=(G.nameBuf.trim()||'CAPTAIN').toUpperCase();
+      G.scores.push({n:nm,p:G.result.profit}); G.scores.sort((a,b)=>b.p-a.p); G.scores=G.scores.slice(0,10); saveScores(G.scores);
+      G.hl=G.scores.findIndex(s=>s.n===nm&&s.p===G.result.profit); SFX.win(); G.screen='scores'; }
+    else if(k==='Backspace'){G.nameBuf=G.nameBuf.slice(0,-1);}
+    else if(/^[A-Z0-9 .\-]$/.test(K)&&G.nameBuf.length<10){G.nameBuf+=K; SFX.key();}
+  } else if(sc==='result'){ if(k===' '||k==='Enter'){G.hl=-1; G.screen='scores'; musicStart();} }
+  else if(sc==='gameover'){ if(k===' '||k==='Enter'){G.screen='title'; musicStart();} }
+}
+window.addEventListener('keydown',onKey);
+cv.addEventListener('pointerdown',()=>{cv.focus(); auInit();});
+cv.focus();
+
+// ---------- main loop ----------
+G.tstars=Array.from({length:70},()=>({x:rnd(0,320),y:rnd(0,200),z:rnd(0.1,1)}));
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now; G.frame++;
+  if(G.screen==='flight'&&!G.paused) flightUpdate(dt);
+  switch(G.screen){
+    case 'title':drawTitle();break; case 'help':drawHelp();break; case 'scores':drawScores(G.hl);break;
+    case 'contracts':drawContracts();break; case 'hire':drawHire();break; case 'map':drawMap();break;
+    case 'flight':drawFlight();break; case 'result':drawResult();break; case 'name':drawName();break;
+    case 'gameover':drawGameOver();break;
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
